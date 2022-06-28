@@ -1,0 +1,19 @@
+<%- include('partials/header'); -%>
+
+
+    <form action="/compose" method="post">
+        <label for="" >Author Name</label> <br>
+        <input class="form-control" type="text" name="authorName" id="" placeholder="Author Name" autocomplete="off"> <br>
+
+        <label for="" >Title</label> <br>
+        <input class="form-control" type="text" name="postTitle" id="" placeholder="Add Title" autocomplete="off"> <br>
+
+
+        <label for="">Post</label><br>
+        <textarea class="form-control" name="postBody" id="" cols="30" rows="10"></textarea> <br>
+
+        <button type="submit" class="btn btn-dark">Publish</button>
+    </form>
+
+    
+<%- include('partials/footer'); -%>
