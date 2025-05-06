@@ -1,292 +1,285 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
+import requests
+import os
+import shutil
+import subprocess
+import time
+import sys
+from pywinauto.application import Application
+from pywinauto import timings
 
-# --- Configuration (Based on Paper's Findings/Defaults) ---
-K_NEIGHBORS = 4  # Number of neighbors for LLR 
-EMBEDDING_DIM = 16 # Dimension Fg of the embedding space 
-LAMBDA_REG = 1e-5 # Regularization for LLR (Paper doesn't specify, using a small value)
-MU_SELECT = 0.15   # Selection interval threshold 
-LAMBDA_EPC = 1.0   # Weight for EPC loss 
-LAMBDA_GAZE = 1.0  # Weight for Gaze loss 
+# --- Configuration ---
+# !! IMPORTANT: MODIFY THESE VALUES !!
+BINARY_URL = "YOUR_FIRMWARE_URL_HERE"  # <--- PASTE THE ACTUAL URL TO THE BINARY (.tar.md5 or similar)
+TARGET_DIR = "C:\\Odin_Firmware"       # <--- SET YOUR DESIRED FOLDER FOR THE FINAL FIRMWARE FILE
+ODIN_EXE_PATH = "C:\\path\\to\\Odin3 vX.XX.exe" # <--- SET THE FULL PATH TO YOUR Odin3.exe
+ADB_EXE_PATH = "adb"                    # Set full path if adb is not in system PATH, e.g., "C:\\platform-tools\\adb.exe"
 
-# --- Model Definition (DAGEN Structure) ---
+# pywinauto timings (increase if automation seems too fast)
+timings.Timings.window_find_timeout = 15 # seconds to wait for a window
+timings.Timings.cpu_usage_timeout = 5    # seconds for cpu stability before action
 
-class FeatureExtractor(nn.Module):
-    """ Feature extractor based on ResNet-18 followed by MLP """
-    def __init__(self, embedding_dim=EMBEDDING_DIM):
-        super().__init__()
-        # Using a pre-trained ResNet-18 as backbone 
-        resnet = models.resnet18(pretrained=True)
-        # Remove the final classification layer
-        modules = list(resnet.children())[:-1]
-        self.backbone = nn.Sequential(*modules)
-        # MLP layer 
-        self.mlp = nn.Linear(resnet.fc.in_features, embedding_dim)
+# Odin specific control identifiers (These might change between Odin versions!)
+# Use tools like Inspect.exe (Windows SDK) or pywinauto's print_control_identifiers()
+# to find the correct identifiers for *your* Odin version.
+ODIN_WINDOW_TITLE_REGEX = r"Odin3.*" # Regex to match the Odin window title
+# Common buttons (examples - ADJUST BASED ON YOUR ODIN):
+# Check buttons like BL, AP, CP, CSC might have different 'auto_id' or 'control_id'
+AP_BUTTON_IDENTIFIER = {"title": "AP", "control_type": "Button"} # Common identifier
+# START_BUTTON_IDENTIFIER = {"title": "Start", "control_type": "Button"} # Common identifier
+START_BUTTON_IDENTIFIER = "Start" # Sometimes simple title works for buttons
 
-    def forward(self, x):
-        x = self.backbone(x)
-        x = torch.flatten(x, 1)
-        embedding = self.mlp(x)
-        return embedding
+# File selection dialog identifiers (usually standard Windows)
+FILE_DIALOG_TITLE = "Open"
+FILE_DIALOG_FILENAME_EDIT_IDENTIFIER = "Edit1" # Often "Edit1" or {"class_name": "Edit", "control_id": 1148}
+FILE_DIALOG_OPEN_BUTTON_IDENTIFIER = {"title": "Open", "control_type": "Button", "control_id": 1} # Often control_id 1
+# --- End Configuration ---
 
-class GazePredictor(nn.Module):
-    """ Simple linear mapping from embedding to gaze direction """
-    def __init__(self, embedding_dim=EMBEDDING_DIM, gaze_dim=2): # gaze_dim=2 for (yaw, pitch) 
-        super().__init__()
-        self.fc = nn.Linear(embedding_dim, gaze_dim) # Linear mapping h 
-
-    def forward(self, embedding):
-        gaze = self.fc(embedding)
-        # Normalize gaze vector (optional, but common for direction)
-        # gaze = F.normalize(gaze, p=2, dim=1) # L2 normalization if needed
-        return gaze
-
-class DAGEN(nn.Module):
-    """ Complete DAGEN Network """
-    def __init__(self, embedding_dim=EMBEDDING_DIM, gaze_dim=2):
-        super().__init__()
-        self.feature_extractor = FeatureExtractor(embedding_dim)
-        self.gaze_predictor = GazePredictor(embedding_dim, gaze_dim)
-
-    def forward(self, x):
-        embedding = self.feature_extractor(x)
-        gaze = self.gaze_predictor(embedding)
-        return embedding, gaze
-
-# --- Loss Function Components ---
-
-def calculate_llr_weights(target_gaze_pred, source_gaze_gt, source_indices, k, lambda_reg):
-    """
-    Calculates Locally Linear Representation (LLR) weights based on Eq. 5.
-
-    Args:
-        target_gaze_pred (Tensor): Predicted gaze for a single target sample (shape: [gaze_dim]).
-        source_gaze_gt (Tensor): Ground truth gaze for k source neighbors (shape: [k, gaze_dim]).
-        source_indices (Tensor): Indices of the k source neighbors.
-        k (int): Number of neighbors.
-        lambda_reg (float): L2 regularization parameter.
-
-    Returns:
-        Tensor: Optimized LLR weights W* (shape: [k]).
-                Returns None if calculation fails (e.g., singular matrix).
-    """
-    gaze_dim = target_gaze_pred.shape[0]
-    target_gaze_pred_k = target_gaze_pred.unsqueeze(0).repeat(k, 1) # Shape [k, gaze_dim]
-
-    # Calculate local covariance matrix Sj (Eq. 4) 
-    diff = target_gaze_pred_k - source_gaze_gt # Shape [k, gaze_dim]
-    Sj = torch.matmul(diff.T, diff) # Shape [gaze_dim, gaze_dim]
-
-    # Add regularization and compute inverse (Eq. 5) 
-    identity = torch.eye(gaze_dim, device=Sj.device) * lambda_reg
+def download_file(url, download_folder):
+    """Downloads a file from a URL to the specified folder."""
     try:
-        # Using solve is generally more stable than direct inverse
-        # We want to solve (Sj + lambda*I) * x = 1_k, but need to handle the denominator
-        # Let M = (Sj + lambda*I)
-        M_inv = torch.linalg.inv(Sj + identity)
-    except torch.linalg.LinAlgError:
-        print("Warning: Singular matrix encountered in LLR weight calculation.")
-        return None # Indicate failure
+        print(f"Attempting to download from: {url}")
+        # Ensure download folder exists
+        os.makedirs(download_folder, exist_ok=True)
 
-    ones_k = torch.ones(k, 1, device=Sj.device)
+        # Get filename from URL or Content-Disposition header
+        response = requests.get(url, stream=True, allow_redirects=True, timeout=30)
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
 
-    # Calculate numerator: M_inv * 1_k (adjusting for matrix shapes)
-    # We actually need the weights W, so we compute M_inv * ones_k (as vector) first
-    # And use the formula from Eq. 5 directly seems more complex than needed for weights
-    # Let's re-derive slightly or use the structure:
-    # W_j* = normalize( (Sj + lambda*I)^-1 * 1_k ) such that sum(W_j*) = 1
-    # Numerator = (S_j + lambda I)^(-1) * 1_k -> This is solving (S_j + lambda I) * W = 1_k ?? No.
+        filename = ""
+        if "content-disposition" in response.headers:
+            cd = response.headers['content-disposition']
+            filename = cd.split('filename=')[-1].strip('"')
+        if not filename:
+            filename = url.split('/')[-1]
+        if not filename: # Fallback if URL is weird
+             filename = "downloaded_firmware"
 
-    # Revisit Eq. 5 structure: num = (Sj + lambda*I)^-1 * 1_k, den = 1_k^T * num
-    # The shapes are tricky. Let's use the definition from paper slightly differently:
-    # Find W that minimizes || target - W @ source ||^2 + lambda * ||W||^2, s.t. sum(W)=1
-    # This is a constrained least squares problem. Eq 5 gives the analytical solution.
+        download_path = os.path.join(download_folder, filename)
+        print(f"Downloading to: {download_path}")
 
-    # Applying Eq 5 directly:
-    num = torch.matmul(M_inv, ones_k) # Shape [gaze_dim, 1] ?? No, this needs careful shape analysis based on paper derivation
+        total_size = int(response.headers.get('content-length', 0))
+        block_size = 8192 # 8KB
+        wrote = 0
+        with open(download_path, 'wb') as f:
+            for chunk in response.iter_content(block_size):
+                wrote += len(chunk)
+                f.write(chunk)
+                if total_size > 0:
+                    done = int(50 * wrote / total_size)
+                    sys.stdout.write(f"\r[{'=' * done}{' ' * (50 - done)}] {wrote / (1024 * 1024):.2f}/{total_size / (1024 * 1024):.2f} MB")
+                    sys.stdout.flush()
+        print("\nDownload complete.")
+        return download_path
+    except requests.exceptions.RequestException as e:
+        print(f"\nError downloading file: {e}")
+        return None
+    except Exception as e:
+        print(f"\nAn unexpected error occurred during download: {e}")
+        return None
 
-    # Let's rethink Sj calculation based on Eq 4 and 5 shapes.
-    # G_i^s = [g_1^s, ..., g_k^s] -> Shape [gaze_dim, k] if column vectors
-    # G_j^t = [g_j^t, ..., g_j^t] -> Shape [gaze_dim, k]
-    # S_j = (G_j^t - G_i^s)^T @ (G_j^t - G_i^s) -> Shape [k, k]
-    # This seems more likely given Wj is [w_j1, ..., w_jk] (k elements)
-
-    G_i_s = source_gaze_gt.T # Shape [gaze_dim, k]
-    G_j_t = target_gaze_pred.unsqueeze(1).repeat(1, k) # Shape [gaze_dim, k]
-    S_j = torch.matmul((G_j_t - G_i_s).T, (G_j_t - G_i_s)) # Shape [k, k] 
-
-    identity_k = torch.eye(k, device=S_j.device) * lambda_reg
+def move_and_rename(source_path, target_dir):
+    """Moves the file, removes .md5 extension if present, and returns the new path."""
     try:
-        M_inv_k = torch.linalg.inv(S_j + identity_k)
-    except torch.linalg.LinAlgError:
-         print("Warning: Singular matrix encountered in LLR weight calculation (k x k).")
-         return None # Indicate failure
+        if not os.path.exists(source_path):
+            print(f"Error: Source file not found at {source_path}")
+            return None
 
-    ones_k_vec = torch.ones(k, 1, device=S_j.device) # Shape [k, 1]
+        filename = os.path.basename(source_path)
+        base_name, ext = os.path.splitext(filename)
 
-    # Eq. 5: W_j* = (M_inv_k @ 1_k) / (1_k^T @ M_inv_k @ 1_k) 
-    numerator = torch.matmul(M_inv_k, ones_k_vec) # Shape [k, 1]
-    denominator = torch.matmul(ones_k_vec.T, numerator) # Shape [1, 1]
+        # Remove .md5 if it's the final extension
+        if ext.lower() == '.md5':
+            new_filename = base_name
+        else:
+            new_filename = filename # Keep original name if no .md5
 
-    if torch.abs(denominator) < 1e-9: # Avoid division by zero
-         print("Warning: Small denominator encountered in LLR weight calculation.")
-         return None
+        # Ensure target directory exists
+        os.makedirs(target_dir, exist_ok=True)
+        target_path = os.path.join(target_dir, new_filename)
 
-    W_star = numerator / denominator # Shape [k, 1]
-    return W_star.squeeze(1) # Return shape [k]
+        print(f"Moving '{source_path}' to '{target_path}'")
+        shutil.move(source_path, target_path)
+        print("Move and rename successful.")
+        return target_path
+    except Exception as e:
+        print(f"Error moving/renaming file: {e}")
+        return None
+
+def run_command(command_parts):
+    """Runs a command line command and prints output."""
+    try:
+        print(f"Running command: {' '.join(command_parts)}")
+        result = subprocess.run(command_parts, capture_output=True, text=True, check=False, shell=False)
+        print("STDOUT:")
+        print(result.stdout if result.stdout else "<No stdout>")
+        print("STDERR:")
+        print(result.stderr if result.stderr else "<No stderr>")
+        if result.returncode != 0:
+            print(f"Warning: Command exited with non-zero status: {result.returncode}")
+        return result.returncode == 0
+    except FileNotFoundError:
+        print(f"Error: Command not found (is '{command_parts[0]}' in your PATH or correctly specified?)")
+        return False
+    except Exception as e:
+        print(f"Error running command {' '.join(command_parts)}: {e}")
+        return False
+
+def automate_odin(odin_path, firmware_path):
+    """Starts Odin, loads firmware, and clicks Start using pywinauto."""
+    try:
+        print("Starting Odin...")
+        # Use start() instead of connect() to launch the application
+        app = Application(backend="uia").start(odin_path) # uia backend is generally preferred
+        time.sleep(5) # Give Odin some time to load
+
+        # Connect to the Odin window
+        print("Connecting to Odin window...")
+        odin_window = app.window(title_re=ODIN_WINDOW_TITLE_REGEX)
+        odin_window.wait('visible', timeout=timings.Timings.window_find_timeout) # Wait until window is ready
+        print("Odin window found.")
+        # odin_window.print_control_identifiers() # Uncomment this to DEBUG identifiers
+
+        # --- Interact with Odin ---
+        # 1. Click the AP (or relevant) button
+        print(f"Clicking AP button (using identifier: {AP_BUTTON_IDENTIFIER})...")
+        ap_button = odin_window.child_window(**AP_BUTTON_IDENTIFIER)
+        ap_button.wait('enabled', timeout=10) # Wait for button to be clickable
+        ap_button.click_input() # Use click_input() for more human-like interaction
+        print("AP button clicked.")
+        time.sleep(1) # Short pause
+
+        # 2. Handle the File Open Dialog
+        print("Handling file open dialog...")
+        file_dialog = app.window(title=FILE_DIALOG_TITLE)
+        file_dialog.wait('visible', timeout=timings.Timings.window_find_timeout)
+        print("File dialog found.")
+
+        # Set the filename
+        print(f"Setting filename: {firmware_path}")
+        # file_dialog.print_control_identifiers() # Uncomment this to DEBUG identifiers
+        filename_edit = file_dialog.child_window(best_match=FILE_DIALOG_FILENAME_EDIT_IDENTIFIER)
+        filename_edit.wait('enabled', timeout=10)
+        filename_edit.set_edit_text(firmware_path) # Use set_edit_text for reliability
+        time.sleep(0.5)
+
+        # Click the 'Open' button
+        print("Clicking 'Open' button in dialog...")
+        open_button = file_dialog.child_window(**FILE_DIALOG_OPEN_BUTTON_IDENTIFIER)
+        open_button.wait('enabled', timeout=10)
+        open_button.click_input()
+        print("File selected.")
+        time.sleep(2) # Give Odin time to load/verify the file
+
+        # 3. Click the Start button in Odin
+        print("Waiting for Odin to be ready for Start...")
+        # Add checks here if needed (e.g., wait for "Added!!" message in Odin's log box)
+        # This requires identifying the log box control.
+        time.sleep(5) # Simple wait for file processing
+
+        print(f"Clicking Start button (using identifier: {START_BUTTON_IDENTIFIER})...")
+        start_button = odin_window.child_window(best_match=START_BUTTON_IDENTIFIER) # Use best_match for flexibility
+        start_button.wait('enabled', timeout=30) # Wait longer, Odin might be busy
+        start_button.click_input()
+        print("Start button clicked. Flashing process initiated.")
+        print("!!! MONITOR THE ODIN WINDOW FOR PROGRESS AND SUCCESS/FAILURE !!!")
+        print("Automation will wait for a fixed time, but manual monitoring is essential.")
+
+        # --- Waiting for Completion (Difficult Part) ---
+        # Reliable waiting is hard. Odin doesn't offer a simple completion signal.
+        # Options:
+        # 1. Fixed Wait: Easiest, but unreliable.
+        # 2. Monitor Log Box: Look for "PASS!" or "FAIL!" text. Requires identifying the log control.
+        # 3. Monitor Window Title/Elements: Check if the "PASS" indicator appears.
+        # We'll use a long fixed wait and recommend manual monitoring.
+        wait_time_seconds = 600 # 10 minutes - ADJUST AS NEEDED
+        print(f"Waiting for {wait_time_seconds} seconds for flashing to potentially complete...")
+        time.sleep(wait_time_seconds)
+        print("Wait time finished. Assuming flashing is done (check Odin!).")
+
+        # Optional: Try to close Odin (can fail if flashing is stuck)
+        try:
+             print("Attempting to close Odin...")
+             odin_window.close()
+             time.sleep(2)
+        except Exception as close_err:
+             print(f"Could not automatically close Odin (may still be running): {close_err}")
+
+        return True
+
+    except timings.TimeoutError:
+        print("Error: Timed out waiting for a window or control in Odin.")
+        print("Possible causes: Incorrect identifiers, Odin version mismatch, Odin not responding.")
+        # odin_window.print_control_identifiers() # Helps debug
+        return False
+    except Exception as e:
+        print(f"An error occurred during Odin automation: {e}")
+        # Try printing identifiers if a window object exists
+        try:
+            if 'odin_window' in locals() and odin_window.exists():
+               print("Attempting to print Odin control identifiers for debugging:")
+               odin_window.print_control_identifiers()
+        except Exception as pe:
+            print(f"Could not print control identifiers: {pe}")
+        return False
+
+# --- Main Script Execution ---
+if __name__ == "__main__":
+    print("--- Android Flashing Automation Script ---")
+
+    # Validate Configuration
+    if "YOUR_FIRMWARE_URL_HERE" in BINARY_URL:
+        print("Error: Please update the BINARY_URL variable in the script.")
+        sys.exit(1)
+    if not os.path.exists(ODIN_EXE_PATH):
+        print(f"Error: Odin executable not found at '{ODIN_EXE_PATH}'. Please update the path.")
+        sys.exit(1)
+    if not os.path.exists(TARGET_DIR):
+         print(f"Warning: Target directory '{TARGET_DIR}' does not exist. It will be created.")
 
 
-def epc_loss(target_embeddings, target_gaze_preds, source_embeddings, source_gaze_gt, k, lambda_reg, mu_select):
-    """
-    Calculates the Embedding with Prediction Consistency (EPC) loss (Eq. 9).
+    # Step 1: Download the binary
+    print("\n[Step 1/7] Downloading Firmware...")
+    user_download_folder = os.path.join(os.path.expanduser("~"), "Downloads")
+    downloaded_path = download_file(BINARY_URL, user_download_folder)
+    if not downloaded_path:
+        print("Exiting due to download failure.")
+        sys.exit(1)
 
-    Args:
-        target_embeddings (Tensor): Embeddings for target batch (shape: [Bt, embed_dim]).
-        target_gaze_preds (Tensor): Predictions for target batch (shape: [Bt, gaze_dim]).
-        source_embeddings (Tensor): Embeddings for source batch (shape: [Bs, embed_dim]).
-        source_gaze_gt (Tensor): Ground truth gaze for source batch (shape: [Bs, gaze_dim]).
-        k (int): Number of neighbors.
-        lambda_reg (float): L2 regularization for LLR.
-        mu_select (float): Selection interval threshold.
+    # Step 2 & 3: Move and Rename
+    print("\n[Step 2 & 3/7] Moving and Renaming Firmware...")
+    final_firmware_path = move_and_rename(downloaded_path, TARGET_DIR)
+    if not final_firmware_path:
+        print("Exiting due to file move/rename failure.")
+        sys.exit(1)
 
-    Returns:
-        Tensor: Scalar EPC loss value.
-                Returns 0 if no valid target samples are found.
-    """
-    Bt, embed_dim = target_embeddings.shape
-    Bs, gaze_dim = source_gaze_gt.shape
-    total_loss = 0.0
-    valid_samples = 0
+    # Step 4: Reboot device to Download mode
+    print("\n[Step 4/7] Rebooting device to Download Mode...")
+    print("Ensure your device is connected via USB and USB Debugging is enabled.")
+    input("Press Enter when ready to reboot device...") # Pause for user confirmation
+    if not run_command([ADB_EXE_PATH, "reboot", "download"]):
+         print("Warning: Failed to execute adb reboot download. Ensure device is connected and adb works.")
+         print("Please manually put the device into Download Mode.")
+         input("Press Enter once the device is in Download Mode...")
+    else:
+         print("Command sent. Waiting for device to enter Download mode (approx 15-30 seconds)...")
+         time.sleep(25)
 
-    # Calculate pairwise distances between target predictions and source ground truth in gaze space
-    # Using angular distance (cosine similarity) might be more appropriate than Euclidean for gaze vectors
-    # Paper uses Eq 1: max(|yaw_diff|, |pitch_diff|) < mu 
-    # Let's use Euclidean distance for simplicity, adapt if needed. Assumes gaze vectors are comparable.
-    # gaze_dist = torch.cdist(target_gaze_preds, source_gaze_gt, p=2) # Shape [Bt, Bs]
+    # Step 5 & 6: Open Odin and Automate Flashing
+    print("\n[Step 5 & 6/7] Starting Odin and Flashing Process...")
+    if not automate_odin(ODIN_EXE_PATH, final_firmware_path):
+        print("Error during Odin automation. Please check the Odin window and flash manually if needed.")
+        print("Exiting script.")
+        sys.exit(1)
+    else:
+        print("Odin automation part finished (or timed out).")
 
-    # Implementing Eq 1 check
-    yaw_diff = torch.abs(target_gaze_preds[:, 0].unsqueeze(1) - source_gaze_gt[:, 0].unsqueeze(0)) # Shape [Bt, Bs]
-    pitch_diff = torch.abs(target_gaze_preds[:, 1].unsqueeze(1) - source_gaze_gt[:, 1].unsqueeze(0)) # Shape [Bt, Bs]
-    max_diff = torch.maximum(yaw_diff, pitch_diff) # Shape [Bt, Bs]
-    neighbor_mask = max_diff < mu_select # Boolean mask [Bt, Bs]
+    # Step 7: Check for device after flashing
+    print("\n[Step 7/7] Checking for device post-flashing...")
+    print("Waiting for device to potentially reboot (approx 60 seconds)...")
+    time.sleep(60)
+    print("Running 'adb devices'...")
+    run_command([ADB_EXE_PATH, "devices"])
 
-    for j in range(Bt): # Iterate through each target sample
-        # Find indices of neighbors in the source batch based on Eq 1 
-        neighbor_indices = torch.where(neighbor_mask[j])[0]
-
-        if len(neighbor_indices) >= k: # Check if enough neighbors found 
-            # Randomly select k neighbors if more are available 
-            perm = torch.randperm(len(neighbor_indices), device=target_embeddings.device)
-            selected_indices = neighbor_indices[perm[:k]]
-
-            # Get data for selected neighbors
-            k_source_gaze_gt = source_gaze_gt[selected_indices] # Shape [k, gaze_dim]
-            k_source_embeddings = source_embeddings[selected_indices] # Shape [k, embed_dim]
-
-            # Calculate LLR weights W* for this target sample 
-            W_star = calculate_llr_weights(target_gaze_preds[j], k_source_gaze_gt, selected_indices, k, lambda_reg)
-
-            if W_star is not None:
-                # Calculate target hypothesis embedding (Eq. 7) 
-                # W_star shape [k], k_source_embeddings shape [k, embed_dim]
-                hypothesis_embedding = torch.matmul(W_star.unsqueeze(0), k_source_embeddings).squeeze(0) # Shape [embed_dim]
-
-                # Calculate L1 distance between hypothesis and predicted embedding (Eq. 9) 
-                loss_j = F.l1_loss(target_embeddings[j], hypothesis_embedding, reduction='sum') # Using sum as L1 distance 'd'
-
-                total_loss += loss_j
-                valid_samples += 1
-
-    if valid_samples == 0:
-        return torch.tensor(0.0, device=target_embeddings.device) # Avoid division by zero
-
-    return total_loss / valid_samples # Average loss over valid samples 
-
-
-def gaze_loss_cosine(gaze_pred, gaze_gt):
-    """
-    Calculates the gaze estimation loss using cosine similarity (Eq. 10).
-
-    Args:
-        gaze_pred (Tensor): Predicted gaze vectors (shape: [B, gaze_dim]).
-        gaze_gt (Tensor): Ground truth gaze vectors (shape: [B, gaze_dim]).
-
-    Returns:
-        Tensor: Scalar loss value (mean angular error in radians).
-    """
-    # Normalize vectors to ensure they are unit vectors for angular calculation
-    gaze_pred_norm = F.normalize(gaze_pred, p=2, dim=1)
-    gaze_gt_norm = F.normalize(gaze_gt, p=2, dim=1)
-
-    # Calculate cosine similarity (dot product of unit vectors)
-    cos_sim = torch.sum(gaze_pred_norm * gaze_gt_norm, dim=1)
-
-    # Clamp values to avoid numerical issues with acos outside [-1, 1]
-    cos_sim = torch.clamp(cos_sim, -1.0 + 1e-7, 1.0 - 1e-7)
-
-    # Calculate angular difference in radians 
-    angle_diff_rad = torch.acos(cos_sim)
-
-    # Return the mean angle difference
-    return torch.mean(angle_diff_rad)
-
-
-# --- Example Usage (Conceptual Training Step) ---
-if __name__ == '__main__':
-    # Dummy Data
-    Bs = 64 # Source batch size 
-    Bt = 64 # Target batch size 
-    img_size = (64, 256) # Example input image size based on paper (h, w)
-    gaze_dim = 2
-
-    source_images = torch.randn(Bs, 3, img_size[0], img_size[1])
-    source_gaze_gt = F.normalize(torch.randn(Bs, gaze_dim), p=2, dim=1) # Example unit gaze vectors
-    target_images = torch.randn(Bt, 3, img_size[0], img_size[1])
-
-    # Model
-    model = DAGEN(embedding_dim=EMBEDDING_DIM, gaze_dim=gaze_dim)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4) # 
-
-    # --- Pre-training Step (Conceptual) ---
-    print("--- Simulating Pre-training ---")
-    model.train()
-    optimizer.zero_grad()
-    source_embeddings_pre, source_gaze_pred_pre = model(source_images)
-    loss_gaze_pre = gaze_loss_cosine(source_gaze_pred_pre, source_gaze_gt)
-    loss_gaze_pre.backward()
-    optimizer.step()
-    print(f"Pre-training Gaze Loss: {loss_gaze_pre.item():.4f}")
-
-
-    # --- Joint Optimization Step (Conceptual) ---
-    print("\n--- Simulating Joint Optimization Step ---")
-    model.train()
-    optimizer.zero_grad()
-
-    # Forward pass for both domains
-    source_embeddings, source_gaze_pred = model(source_images)
-    target_embeddings, target_gaze_pred = model(target_images) # Target predictions needed for LLR neighbors 
-
-    # Calculate losses
-    # 1. Gaze loss on source domain 
-    loss_gaze = gaze_loss_cosine(source_gaze_pred, source_gaze_gt)
-
-    # 2. EPC loss between target and source 
-    # Note: Using source_gaze_gt for LLR as mentioned in paper for higher accuracy 
-    loss_epc = epc_loss(target_embeddings, target_gaze_pred,
-                        source_embeddings, source_gaze_gt, # Using source GT here
-                        k=K_NEIGHBORS, lambda_reg=LAMBDA_REG, mu_select=MU_SELECT)
-
-    # 3. Total DA loss (Eq. 8) 
-    total_loss = (LAMBDA_GAZE * loss_gaze) + (LAMBDA_EPC * loss_epc)
-
-    # Backpropagation
-    total_loss.backward()
-    optimizer.step()
-
-    print(f"Joint Gaze Loss: {loss_gaze.item():.4f}")
-    print(f"Joint EPC Loss: {loss_epc.item():.4f}")
-    print(f"Total Joint Loss: {total_loss.item():.4f}")
-
+    print("\n--- Automation Script Finished ---")
+    print("Please verify the flashing result on your device and in the Odin log.")
+    
